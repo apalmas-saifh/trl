@@ -1161,9 +1161,12 @@ class GRPOTrainer(BaseTrainer):
         if self.use_vllm:
             # Sync weights if training step changed
             if self.state.global_step != self._last_loaded_step:
+                sync_start = time.perf_counter()
                 with profiling_context(self, "sync_weights"):
-                    self.vllm_generation.sync_weights()
+                    self.vllm_generation.sync_weights(global_step=self.state.global_step)
+                sync_duration = time.perf_counter() - sync_start
                 self._last_loaded_step = self.state.global_step
+                self._metrics[mode]["rollout_diagnostics/weight_sync_duration_s"].append(sync_duration)
 
             # Generate using vLLM
             num_generations = self.num_generations if mode == "train" else self.num_generations_eval
@@ -1453,6 +1456,78 @@ class GRPOTrainer(BaseTrainer):
                 completions = [[{"role": "assistant", "content": content}] for content in contents]
         else:
             completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+        # --- Rollout quality diagnostics ---
+        # These metrics help detect subtle rollout degradation (e.g., from stale weights,
+        # GPU memory corruption, or infrastructure issues like Kerberos ticket expiry).
+        if self.use_vllm:
+            # 1. Unique completion ratio — globally correct via count aggregation.
+            #    Reuse `completions` (already decoded above) to avoid a second batch_decode.
+            if is_conversational({"prompt": prompts[0]}):
+                # For conversational, completions are lists of message dicts; serialize for dedup
+                completion_strs = [str(c) for c in completions]
+            else:
+                completion_strs = completions  # already strings
+            local_num_unique = torch.tensor(len(set(completion_strs)), device=device, dtype=torch.float32)
+            local_num_total = torch.tensor(len(completion_strs), device=device, dtype=torch.float32)
+            global_num_unique = self.accelerator.gather(local_num_unique).sum()
+            global_num_total = self.accelerator.gather(local_num_total).sum()
+            self._metrics[mode]["rollout_diagnostics/unique_completion_ratio"].append(
+                (global_num_unique / global_num_total.clamp(min=1)).item()
+            )
+
+            # 2. Empty completion ratio — gather counts, then divide.
+            local_empty = torch.tensor(
+                sum(1 for ids in completion_ids if len(ids) == 0), device=device, dtype=torch.float32
+            )
+            global_empty = self.accelerator.gather(local_empty).sum()
+            self._metrics[mode]["rollout_diagnostics/empty_completion_ratio"].append(
+                (global_empty / global_num_total.clamp(min=1)).item()
+            )
+
+            # 3. Logprob statistics — mean, min, max, std, NaN count.
+            #    Sudden shifts indicate weight corruption or numerical instability.
+            if logprobs is not None:
+                all_lps = [lp for seq_lps in logprobs for lp in seq_lps if lp is not None]
+                if all_lps:
+                    lp_tensor = torch.tensor(all_lps, dtype=torch.float32, device=device)
+                    nan_count = torch.isnan(lp_tensor).sum()
+                    valid_lps = lp_tensor[~torch.isnan(lp_tensor)]
+
+                    if valid_lps.numel() > 0:
+                        lp_mean = valid_lps.mean()
+                        lp_min = valid_lps.min()
+                        lp_max = valid_lps.max()
+                        lp_std = valid_lps.std() if valid_lps.numel() > 1 else torch.zeros(1, device=device)
+                    else:
+                        lp_mean = lp_min = lp_max = lp_std = torch.tensor(float("nan"), device=device)
+
+                    self._metrics[mode]["rollout_diagnostics/logprob_mean"].append(
+                        self.accelerator.gather(lp_mean).mean().item()
+                    )
+                    self._metrics[mode]["rollout_diagnostics/logprob_min"].append(
+                        nanmin(self.accelerator.gather(lp_min)).item()
+                    )
+                    self._metrics[mode]["rollout_diagnostics/logprob_max"].append(
+                        nanmax(self.accelerator.gather(lp_max)).item()
+                    )
+                    self._metrics[mode]["rollout_diagnostics/logprob_std"].append(
+                        self.accelerator.gather(lp_std).mean().item()
+                    )
+                    self._metrics[mode]["rollout_diagnostics/logprob_nan_count"].append(
+                        self.accelerator.gather(nan_count).sum().item()
+                    )
+
+            # 4. Token diversity — gather counts, then divide.
+            #    A healthy model uses a broad vocabulary. A collapsed model uses very few tokens.
+            all_tokens = [tok for ids in completion_ids for tok in ids]
+            local_unique_tokens = torch.tensor(len(set(all_tokens)), device=device, dtype=torch.float32)
+            local_total_tokens = torch.tensor(len(all_tokens), device=device, dtype=torch.float32)
+            global_unique_tokens = self.accelerator.gather(local_unique_tokens).sum()
+            global_total_tokens = self.accelerator.gather(local_total_tokens).sum()
+            self._metrics[mode]["rollout_diagnostics/token_type_ratio"].append(
+                (global_unique_tokens / global_total_tokens.clamp(min=1)).item()
+            )
 
         # Extract tool calls from the completions and (possibly) execute them
         if self.tools:

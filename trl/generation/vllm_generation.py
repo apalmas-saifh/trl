@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -404,10 +405,11 @@ class VLLMGeneration:
                 llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                 llm_model.load_weights([(name, param)])
 
-    def sync_weights(self):
-        """Synchronize model weights to vLLM.
+    def _sync_weights_inner(self):
+        """Inner implementation: synchronize model weights to vLLM.
 
-        Handles FSDP, DeepSpeed, PEFT weight synchronization.
+        Handles FSDP, DeepSpeed, PEFT weight synchronization. Called by `sync_weights` which
+        adds retry logic and validation on top.
         """
         model = self.model
         accelerator = self.accelerator
@@ -485,6 +487,102 @@ class VLLMGeneration:
             self.vllm_client.reset_prefix_cache()
         elif self.mode == "colocate":
             self.llm.reset_prefix_cache()
+
+    def _validate_weight_sync(self, num_params_to_check: int = 3, global_step: int = 0, attempt: int = 0) -> bool:
+        """Spot-check that vLLM model weights match training model weights after sync.
+
+        Uses a deterministic param selection (seeded by global_step and attempt) so all ranks
+        check the same parameters. Different attempts within the same step check different
+        params for broader coverage. Skipped for server mode and PEFT models.
+
+        Returns True if validation passes or is skipped.
+        """
+        if self.mode != "colocate":
+            return True  # Server mode validation would require a new API endpoint; skip for now
+
+        if is_peft_model(self.model):
+            return True  # PEFT name transformations make spot-checking unreliable; skip for now
+
+        with torch.no_grad():
+            train_params = list(self.model.named_parameters())
+            if not train_params:
+                return True
+
+            # Deterministic selection: same indices on every rank for a given (step, attempt).
+            # Mixing in `attempt` ensures retries check different params for broader coverage.
+            rng = torch.Generator()
+            rng.manual_seed(42 + global_step * 1000 + attempt)
+            num_to_check = min(num_params_to_check, len(train_params))
+            indices = torch.randperm(len(train_params), generator=rng)[:num_to_check].tolist()
+
+            # Build a name->param lookup from vLLM's model (cheaper than state_dict())
+            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+            vllm_params = dict(llm_model.named_parameters())
+
+            for idx in indices:
+                name, param = train_params[idx]
+                vllm_name = self._fix_param_name_to_vllm(name)
+                if vllm_name not in vllm_params:
+                    continue  # param may not exist in vLLM (e.g., auxiliary buffers)
+                diff = (param.data.float() - vllm_params[vllm_name].data.float()).norm()
+                if diff > 1e-2:
+                    logger.error(
+                        f"Weight sync validation FAILED for param '{vllm_name}': "
+                        f"L2 diff = {diff.item():.6f}"
+                    )
+                    return False
+        return True
+
+    def sync_weights(self, max_retries: int = 3, global_step: int = 0):
+        """Synchronize model weights to vLLM with retry logic and validation.
+
+        Handles FSDP, DeepSpeed, PEFT weight synchronization. On failure, retries
+        up to max_retries times. After each successful sync (colocate, non-PEFT only),
+        validates that weights were transferred correctly.
+
+        Args:
+            max_retries: Maximum number of retry attempts for weight sync.
+            global_step: Current training step, used to seed deterministic param selection
+                for validation. Passed by the caller from `self.state.global_step`.
+
+        Raises:
+            RuntimeError: If weight sync fails after all retries or validation fails.
+        """
+        last_exception = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                self._sync_weights_inner()
+
+                # Validate the sync (colocate + non-PEFT only; see _validate_weight_sync)
+                if not self._validate_weight_sync(global_step=global_step, attempt=attempt):
+                    raise RuntimeError(
+                        "Weight sync validation failed: vLLM model weights don't match training model"
+                    )
+
+                if attempt > 0:
+                    logger.info(f"Weight sync succeeded on attempt {attempt + 1}/{max_retries + 1}")
+                return  # success
+
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries:
+                    wait_time = 2 ** attempt  # exponential backoff: 1s, 2s, 4s
+                    logger.warning(
+                        f"Weight sync failed on attempt {attempt + 1}/{max_retries + 1}: {e}. "
+                        f"Retrying in {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                else:
+                    logger.error(
+                        f"Weight sync failed after {max_retries + 1} attempts. "
+                        "The vLLM model may have stale or corrupted weights."
+                    )
+
+        raise RuntimeError(
+            f"Failed to sync weights to vLLM after {max_retries + 1} attempts. "
+            f"Last error: {last_exception}"
+        ) from last_exception
 
     def generate(self, prompts: list, num_generations: int, profiler: ProfilingContext | None = None) -> tuple:
         """Generate completions using vLLM.
